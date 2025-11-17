@@ -1,6 +1,6 @@
 import express from 'express';
 import cors from 'cors';
-import { GoogleGenAI } from "@google/generative-ai";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -25,7 +25,7 @@ app.use(express.json({ limit: '10mb' }));
 // Initialize Google AI
 let ai;
 try {
-    ai = new GoogleGenAI({
+    ai = new GoogleGenerativeAI({
         apiKey: process.env.GOOGLE_AI_API_KEY
     });
     console.log('✅ Google AI initialized successfully');
