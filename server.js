@@ -1,6 +1,6 @@
 import express from 'express';
 import cors from 'cors';
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI } from "@google/generative-ai";
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -11,7 +11,7 @@ const PORT = process.env.PORT || 3000;
 // CORS Configuration - UPDATE WITH YOUR HOSTINGER DOMAIN
 app.use(cors({
     origin: [
-        'https://yourdomain.com',           // ⚠️ CHANGE THIS
+        'https://atmospheres.digicomm.online/',           // ⚠️ CHANGE THIS
         'https://www.yourdomain.com',       // ⚠️ CHANGE THIS
         'http://localhost:3000',            // For local testing
     ],
