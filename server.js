@@ -8,8 +8,7 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ========= CONFIG: API KEY + BASE URL =========
-
+// === API KEY + BASE URL ===
 const API_KEY =
   process.env.GOOGLE_AI_API_KEY ||
   process.env.GOOGLE_API_KEY ||
@@ -23,21 +22,19 @@ const PUBLIC_BACKEND_URL =
 
 if (!API_KEY) {
   console.error(
-    '❌ No Gemini API key found. Set GOOGLE_AI_API_KEY or GOOGLE_API_KEY or GEMINI_API_KEY in Render.'
+    '❌ No Gemini/Veo API key found. Set GOOGLE_AI_API_KEY or GOOGLE_API_KEY or GEMINI_API_KEY in Render.'
   );
 }
 
-// ========= CORS CONFIG =========
-
+// === CORS CONFIG ===
 const allowedOrigins = [
-  'https://atmospheres.digicomm.online', // your frontend
-  'http://localhost:3000',               // local testing
+  'https://atmospheres.digicomm.online',
+  'http://localhost:3000',
 ];
 
 app.use(
   cors({
     origin(origin, callback) {
-      // Allow tools without Origin (curl, Postman, etc.)
       if (!origin || allowedOrigins.includes(origin)) {
         return callback(null, true);
       }
@@ -49,41 +46,40 @@ app.use(
   })
 );
 
-// Explicitly handle preflight
+// Preflight
 app.options('*', cors());
 
 app.use(express.json({ limit: '10mb' }));
 
-// ========= IN-MEMORY OPERATION STORE =========
+// === Helper: extract video URI from Veo response ===
+function extractVideoUri(response) {
+  if (!response) return null;
 
-/**
- * operations Map structure:
- * {
- *   [operationId]: {
- *     id,
- *     status: 'processing' | 'completed',
- *     visualPrompt,
- *     audioPrompt,
- *     duration,
- *     aspectRatio,
- *     createdAt,
- *     completedAt?,
- *     remoteName,   // long-running operation name from Google
- *     videoUri?,    // Google media URI (private)
- *     videoUrl?,    // public backend URL (for frontend)
- *     metadata?
- *   }
- * }
- */
-const operations = new Map();
+  // Official Veo 3.1 structure:
+  // response.generateVideoResponse.generatedSamples[0].video.uri
+  if (
+    response.generateVideoResponse &&
+    Array.isArray(response.generateVideoResponse.generatedSamples) &&
+    response.generateVideoResponse.generatedSamples[0]?.video?.uri
+  ) {
+    return response.generateVideoResponse.generatedSamples[0].video.uri;
+  }
 
-function makeOperationId() {
-  return Date.now().toString(36) + Math.random().toString(36).slice(2);
+  // Fallbacks for slightly different shapes, just in case:
+  if (response.result?.generatedVideos?.[0]?.video?.uri) {
+    return response.result.generatedVideos[0].video.uri;
+  }
+  if (response.result?.generatedVideos?.[0]?.uri) {
+    return response.result.generatedVideos[0].uri;
+  }
+
+  console.warn('⚠️ Could not extract videoUri from response:', JSON.stringify(response));
+  return null;
 }
 
-// ========= ROUTES =========
+// === ROUTES ===
 
-// Root health/info
+// Root info
 app.get('/', (req, res) => {
   res.json({
     status: 'healthy',
@@ -107,14 +103,15 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// ========= GENERATE VIDEO (TEXT → VIDEO) =========
-
+// === GENERATE VIDEO ===
 app.post('/api/generate', async (req, res) => {
   try {
     if (!API_KEY) {
       return res.status(500).json({
+        success: false,
         error: 'Google AI not configured',
-        message: 'Missing API key (GOOGLE_AI_API_KEY / GOOGLE_API_KEY / GEMINI_API_KEY)',
+        message:
+          'Missing API key (GOOGLE_AI_API_KEY / GOOGLE_API_KEY / GEMINI_API_KEY)',
       });
     }
 
@@ -126,17 +123,20 @@ app.post('/api/generate', async (req, res) => {
     } = req.body;
 
     if (!visualPrompt) {
-      return res.status(400).json({ error: 'Missing required field: visualPrompt' });
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required field: visualPrompt',
+      });
     }
 
-    console.log(`🎬 Generating video for prompt: "${visualPrompt.substring(0, 60)}..."`);
+    console.log(
+      `🎬 Generating video for prompt: "${visualPrompt.substring(0, 80)}..."`
+    );
 
-    // Combine visual + audio descriptions into one prompt for now
     const combinedPrompt = audioPrompt
       ? `${visualPrompt}\n\nAudio description: ${audioPrompt}`
       : visualPrompt;
 
-    // Map duration string → numeric seconds (approximate)
     const durationMap = {
       '5 seconds': 5,
       '10 seconds': 10,
@@ -145,7 +145,7 @@ app.post('/api/generate', async (req, res) => {
     };
     const durationSeconds = durationMap[duration] || 10;
 
-    // Call Veo long-running endpoint (REST)
+    // Call Veo long-running endpoint
     const resp = await fetch(
       `${BASE_URL}/models/veo-3.1-generate-preview:predictLongRunning`,
       {
@@ -158,11 +158,12 @@ app.post('/api/generate', async (req, res) => {
           instances: [
             {
               prompt: combinedPrompt,
-              // You can experiment with extra fields later:
-              // "durationSeconds": durationSeconds,
-              // "aspectRatio": aspectRatio,
             },
           ],
+          parameters: {
+            aspectRatio,
+            durationSeconds,
+          },
         }),
       }
     );
@@ -171,43 +172,25 @@ app.post('/api/generate', async (req, res) => {
       const text = await resp.text();
       console.error('❌ Veo generation HTTP error:', resp.status, text);
       return res.status(500).json({
+        success: false,
         error: 'Generation failed',
         message: `Veo HTTP ${resp.status}: ${text}`,
       });
     }
 
     const data = await resp.json();
-    const remoteName = data.name; // long-running operation name
-
-    if (!remoteName) {
+    const operationName = data.name; // e.g. "models/veo-3.1-generate-preview/operations/123..."
+    if (!operationName) {
       console.error('❌ Veo response missing operation name:', data);
       return res.status(500).json({
+        success: false,
         error: 'Generation failed',
         message: 'Veo response missing operation name',
       });
     }
 
-    const operationId = makeOperationId();
-
-    // Store operation
-    operations.set(operationId, {
-      id: operationId,
-      status: 'processing',
-      visualPrompt,
-      audioPrompt,
-      duration,
-      aspectRatio,
-      createdAt: Date.now(),
-      remoteName,
-      videoUri: null,
-      videoUrl: null,
-      metadata: null,
-    });
-
-    // Kick off background polling
-    monitorOperation(operationId).catch((err) =>
-      console.error('Background monitor error:', err)
-    );
+    // Use URL-encoded operationName as ID (no in-memory map needed)
+    const operationId = encodeURIComponent(operationName);
 
     res.json({
       success: true,
@@ -218,39 +201,27 @@ app.post('/api/generate', async (req, res) => {
   } catch (error) {
     console.error('❌ Generation error:', error);
     res.status(500).json({
+      success: false,
       error: 'Generation failed',
       message: error.message,
     });
   }
 });
 
-// ========= STATUS CHECK =========
-
+// === STATUS CHECK ===
 app.get('/api/status/:id', async (req, res) => {
   try {
+    if (!API_KEY) {
+      return res.status(500).json({
+        success: false,
+        error: 'Google AI not configured',
+      });
+    }
+
     const operationId = req.params.id;
-    const stored = operations.get(operationId);
+    const operationName = decodeURIComponent(operationId); // back to Google's name
 
-    if (!stored) {
-      return res.status(404).json({
-        error: 'Operation not found',
-        operationId,
-      });
-    }
-
-    // If already completed, return cached result
-    if (stored.status === 'completed' && stored.videoUrl) {
-      return res.json({
-        success: true,
-        status: 'completed',
-        operationId,
-        videoUrl: stored.videoUrl,
-        metadata: stored.metadata,
-      });
-    }
-
-    // Otherwise, refresh from Google
-    const statusResp = await fetch(`${BASE_URL}/${stored.remoteName}`, {
+    const statusResp = await fetch(`${BASE_URL}/${operationName}`, {
       method: 'GET',
       headers: { 'x-goog-api-key': API_KEY },
     });
@@ -259,6 +230,7 @@ app.get('/api/status/:id', async (req, res) => {
       const text = await statusResp.text();
       console.error('❌ Status HTTP error:', statusResp.status, text);
       return res.status(500).json({
+        success: false,
         error: 'Status check failed',
         message: `Veo status HTTP ${statusResp.status}: ${text}`,
       });
@@ -266,147 +238,108 @@ app.get('/api/status/:id', async (req, res) => {
 
     const json = await statusResp.json();
 
-    if (json.done) {
-      const videoUri =
-        json.response?.generateVideoResponse?.generatedSamples?.[0]?.video?.uri ||
-        null;
-
-      const publicVideoUrl = `${PUBLIC_BACKEND_URL}/api/video/${operationId}`;
-
-      stored.status = 'completed';
-      stored.videoUri = videoUri;
-      stored.videoUrl = publicVideoUrl;
-      stored.metadata = json.response;
-      stored.completedAt = Date.now();
-
+    if (!json.done) {
       return res.json({
         success: true,
-        status: 'completed',
+        status: 'processing',
         operationId,
-        videoUrl: publicVideoUrl,
-        metadata: json.response,
+        message: 'Video is still generating...',
       });
     }
 
-    // Still processing
+    const videoUri = extractVideoUri(json.response);
+    if (!videoUri) {
+      return res.status(500).json({
+        success: false,
+        status: 'failed',
+        error: 'Video URI not found in Veo response',
+        rawResponse: json,
+      });
+    }
+
+    const publicVideoUrl = `${PUBLIC_BACKEND_URL}/api/video/${operationId}`;
+
     return res.json({
       success: true,
-      status: 'processing',
+      status: 'completed',
       operationId,
-      message: 'Video is still generating...',
+      videoUrl: publicVideoUrl,
+      metadata: json.response,
     });
   } catch (error) {
     console.error('❌ Status check error:', error);
     res.status(500).json({
+      success: false,
       error: 'Status check failed',
       message: error.message,
     });
   }
 });
 
-// ========= BACKGROUND MONITOR =========
-
-async function monitorOperation(operationId) {
-  const maxAttempts = 120; // ~2 minutes if every second
-  let attempts = 0;
-
-  const interval = setInterval(async () => {
-    attempts++;
-
-    const stored = operations.get(operationId);
-    if (!stored) {
-      clearInterval(interval);
-      return;
-    }
-
-    if (stored.status === 'completed') {
-      clearInterval(interval);
-      return;
-    }
-
-    try {
-      const resp = await fetch(`${BASE_URL}/${stored.remoteName}`, {
-        method: 'GET',
-        headers: { 'x-goog-api-key': API_KEY },
-      });
-
-      if (!resp.ok) {
-        const text = await resp.text();
-        console.error(
-          `❌ Monitoring HTTP error for ${operationId}:`,
-          resp.status,
-          text
-        );
-        return;
-      }
-
-      const json = await resp.json();
-
-      if (json.done) {
-        const videoUri =
-          json.response?.generateVideoResponse?.generatedSamples?.[0]?.video?.uri ||
-          null;
-
-        const publicVideoUrl = `${PUBLIC_BACKEND_URL}/api/video/${operationId}`;
-
-        operations.set(operationId, {
-          ...stored,
-          status: 'completed',
-          videoUri,
-          videoUrl: publicVideoUrl,
-          metadata: json.response,
-          completedAt: Date.now(),
-        });
-
-        console.log(`✅ Video ready: ${operationId}`);
-        clearInterval(interval);
-      }
-    } catch (err) {
-      console.error(`❌ Monitoring error for ${operationId}:`, err);
-    }
-
-    if (attempts >= maxAttempts) {
-      console.log(`⏱️ Monitoring timeout for ${operationId}`);
-      clearInterval(interval);
-    }
-  }, 1000);
-}
-
-// ========= VIDEO PROXY (BACKEND → GOOGLE → FRONTEND) =========
-
+// === VIDEO PROXY (STREAM VIDEO TO BROWSER) ===
 app.get('/api/video/:id', async (req, res) => {
   try {
-    const operationId = req.params.id;
-    const stored = operations.get(operationId);
-
-    if (!stored || !stored.videoUri) {
-      return res.status(404).json({ error: 'Video not found', operationId });
+    if (!API_KEY) {
+      return res.status(500).json({
+        error: 'Google AI not configured',
+      });
     }
 
-    const downloadUrl = `${BASE_URL}/${stored.videoUri}?alt=media`;
+    const operationId = req.params.id;
+    const operationName = decodeURIComponent(operationId);
 
-    const resp = await fetch(downloadUrl, {
+    // Get latest operation status to obtain the video URI
+    const statusResp = await fetch(`${BASE_URL}/${operationName}`, {
       method: 'GET',
       headers: { 'x-goog-api-key': API_KEY },
     });
 
-    if (!resp.ok) {
-      const text = await resp.text();
-      console.error('❌ Video download HTTP error:', resp.status, text);
-      return res.status(resp.status).send(text);
+    if (!statusResp.ok) {
+      const text = await statusResp.text();
+      console.error('❌ Video status HTTP error:', statusResp.status, text);
+      return res.status(statusResp.status).send(text);
+    }
+
+    const json = await statusResp.json();
+    if (!json.done) {
+      return res.status(202).json({
+        error: 'Video not ready yet',
+        status: 'processing',
+      });
+    }
+
+    const videoUri = extractVideoUri(json.response);
+    if (!videoUri) {
+      return res.status(500).json({
+        error: 'Video URI not found in Veo response',
+      });
+    }
+
+    // videoUri is something like: "files/abc123:download?alt=media"
+    const downloadUrl = `${BASE_URL}/${videoUri}`;
+
+    const videoResp = await fetch(downloadUrl, {
+      method: 'GET',
+      headers: { 'x-goog-api-key': API_KEY },
+    });
+
+    if (!videoResp.ok) {
+      const text = await videoResp.text();
+      console.error('❌ Video download HTTP error:', videoResp.status, text);
+      return res.status(videoResp.status).send(text);
     }
 
     const contentType =
-      resp.headers.get('content-type') || 'video/mp4';
-    const contentLength = resp.headers.get('content-length');
+      videoResp.headers.get('content-type') || 'video/mp4';
+    const contentLength = videoResp.headers.get('content-length');
 
     res.setHeader('Content-Type', contentType);
     if (contentLength) {
       res.setHeader('Content-Length', contentLength);
     }
 
-    // Stream Google response to the browser
-    const nodeStream = Readable.fromWeb(resp.body);
+    // Stream to browser
+    const nodeStream = Readable.fromWeb(videoResp.body);
     nodeStream.pipe(res);
   } catch (error) {
     console.error('❌ Video proxy error:', error);
@@ -417,8 +350,7 @@ app.get('/api/video/:id', async (req, res) => {
   }
 });
 
-// ========= ERROR HANDLER & START =========
-
+// === ERROR HANDLER & START ===
 app.use((err, req, res, next) => {
   console.error('Server error middleware:', err);
   res.status(500).json({
